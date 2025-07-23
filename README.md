@@ -1,6 +1,6 @@
 # Isaac Sim Procedural Terrain & Sensor Simulation Framework
 
-> ⚙️ In development as part of an internship project at **Georgia Tech Europe – DREAM LABS**
+> ⚙️ In development as part of a project at **Georgia Tech Europe – DREAM LABS**
 
 This repository contains a modular simulation framework built in **NVIDIA Isaac Sim**, focused on large-scale procedural terrain generation and **real-time ROS2 sensor integration** for robotics research and testing.
 
