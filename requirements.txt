@@ -1,0 +1,4 @@
+isaacsim[all]==4.5.0 --extra-index-url https://pypi.nvidia.com
+isaacsim[extscache]==4.5.0 --extra-index-url https://pypi.nvidia.com
+isaaclab
+warp-lang
