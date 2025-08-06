@@ -18,14 +18,13 @@
     - "patchy" style grass models using probability
     - Scaling based on local density using a convolution filter
 * Realtime LOD/tile streaming based on robot position for world optimization
+* Publishes Husky Lidar to ROS2
+* Publishes Husky ThirdPersonCamera to ROS2 
 
 ## TO-DO
 
-* IMU currently displays angular velocity on isaac sim viewport -> publish IMU properties on ROS2
-* Lidar is active but does not display or publish to ROS during runtime
-* Husky Front Camera is active but does not display or publish to ROS during runtime
-* Tree models probability still not pseudo-random
-
+* IMU currently displays angular velocity on isaac sim viewport but doesnt publish IMU properties on ROS2
+* Tree models designation still not pseudo-random
 
 ## Installation 
 
