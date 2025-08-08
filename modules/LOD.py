@@ -38,48 +38,68 @@ Folder structure:
 """
 
 import os
-from pxr import Usd
 from pxr import Usd, UsdGeom, UsdShade, Sdf
 
 
-def generate_lod_variants(grass_dir):
+def generate_lod_variants(grass_dir: str):
     for file in os.listdir(grass_dir):
         if not file.endswith((".usd", ".usdc", ".usda")):
             continue
 
         abs_path = os.path.abspath(os.path.join(grass_dir, file))
         try:
-            src_stage = Usd.Stage.Open(abs_path)
+            src = Usd.Stage.Open(abs_path)
         except Exception as e:
             print(f"[!] Failed to open {abs_path}: {e}")
             continue
 
-        # Confirm required LOD prims exist
-        lod_paths = [prim.GetPath().pathString for prim in src_stage.Traverse()]
-        if "/root/Grass_LOD0" not in lod_paths or "/root/Grass_LOD1" not in lod_paths:
-            print(f"[!] Skipping {file} — missing Grass_LOD0 or Grass_LOD1")
+        # Verify the source has the expected LOD prims
+        has_lod0 = bool(src.GetPrimAtPath("/root/Grass_LOD0"))
+        has_lod1 = bool(src.GetPrimAtPath("/root/Grass_LOD1"))
+        if not (has_lod0 and has_lod1):
+            print(f"[!] Skipping {file} — missing /root/Grass_LOD0 or /root/Grass_LOD1")
             continue
 
-        # Create destination USD
         base_name = os.path.splitext(file)[0]
         dst_path = os.path.join(grass_dir, f"{base_name}LOD.usda")
+
         stage = Usd.Stage.CreateNew(dst_path)
+
+        # (You can use /World/Looks or /Looks; both are in this file's scope.)
         material = create_material(base_name, stage, grass_dir)
+
+        # Build LOD variant prims
         UsdGeom.Xform.Define(stage, "/World")
         root = stage.DefinePrim("/World/Grass_LOD", "Xform")
-        variant_set = root.GetVariantSets().AddVariantSet("LODVariant")
+        vset = root.GetVariantSets().AddVariantSet("LODVariant")
 
-        for lod in ["LOD0", "LOD1"]:
-            variant_set.AddVariant(lod)
-            variant_set.SetVariantSelection(lod)
-            with variant_set.GetVariantEditContext():
-                lod_prim = stage.DefinePrim(f"/World/Grass_LOD/Grass_{lod}", "Xform")
-                UsdShade.MaterialBindingAPI(lod_prim).Bind(material)
+        for lod in ("LOD0", "LOD1"):
+            vset.AddVariant(lod)
+            vset.SetVariantSelection(lod)
+            with vset.GetVariantEditContext():
+                lod_prim_path = f"/World/Grass_LOD/Grass_{lod}"
+                lod_prim = stage.DefinePrim(lod_prim_path, "Xform")
+
+                # Reference the corresponding prim from the source file
                 lod_prim.GetReferences().AddReference(abs_path, f"/root/Grass_{lod}")
+
+                # Wipe any material bindings inside the referenced subtree (authored as overrides here)
+                _clear_bindings_recursive(stage, lod_prim_path)
+
+                # Bind our in-file material (guaranteed in-scope)
+                UsdShade.MaterialBindingAPI(lod_prim).Bind(material)
 
         stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
         stage.Save()
         print(f"✅ Generated: {dst_path}")
+
+
+def _clear_bindings_recursive(stage: Usd.Stage, root_path: str):
+    """Authors 'over' opinions that remove any material bindings under root_path."""
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(root_path)):
+        UsdShade.MaterialBindingAPI(prim).UnbindAllBindings()
+        # If you want to be extra explicit and prevent inherited bindings:
+        # UsdShade.MaterialBindingAPI(prim).BlockMaterialBinding()
 
 
 def create_material(base_name, stage, grass_dir):
@@ -151,5 +171,5 @@ def create_material(base_name, stage, grass_dir):
 
 
 # Use absolute or relative as you need
-grass_dir = "assets/models/trees"
+grass_dir = "assets/models/grass"
 generate_lod_variants(grass_dir)
