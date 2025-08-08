@@ -26,6 +26,12 @@ Key References:
     - `LOD.py`: convert high/low detail assets to IsaacSim LOD-supported USDs.
 """
 
+import sys
+
+early = [m for m in sys.modules if m.startswith(("omni.", "pxr", "carb"))]
+if early:
+    print("[WARN] Omni/USD modules imported before SimulationApp:", early)
+
 import os
 import time
 import argparse
@@ -34,7 +40,10 @@ import numpy as np
 # === STEP 0: Initialize Isaac Sim application ===
 # Must be done before any pxr/Omni imports.
 # Set HEADLESS=True for non-graphical mode (faster for batch runs).
-from isaacsim import SimulationApp
+try:
+    from omni.isaac.kit import SimulationApp  # preferred when available
+except ModuleNotFoundError:
+    from isaacsim import SimulationApp  # fallback for pip/venv setups
 
 HEADLESS = False
 simulation_app = SimulationApp(
@@ -49,10 +58,11 @@ from isaacsim.core.api import World
 import isaacsim.core.utils.prims as prims_utils
 from omni.isaac.core.utils.extensions import enable_extension
 import omni.kit.viewport.utility as vp_utils
+import omni.kit.commands
 
 # Project modules (procedural generation pipeline)
 from modules.fbm import NoiseGenerator
-from modules.terrain_mesh import TerrainMeshGenerator
+from modules.warp_terrain_mesh import TerrainMeshGenerator
 from modules.poisson import PoissonClass
 from modules.instancing import Instancer
 from modules.texture_bind import assign_cube_uvs
@@ -127,7 +137,7 @@ parser.add_argument(
     "--tile-radius", type=int, default=1, help="tiles to load ahead of robot"
 )
 parser.add_argument(
-    "--veg-radius", type=int, default=8, help="vegetation tiles to load ahead of robot"
+    "--veg-radius", type=int, default=1, help="vegetation tiles to load ahead of robot"
 )
 args = parser.parse_args()
 
@@ -170,20 +180,22 @@ noise.generate_and_save_area(
 
 # === STEP 4: Mesh generation (OBJ) ===
 # Converts heightmap to OBJ mesh, applies bump maps for micro detail.
-obj_path = os.path.join(
-    args.output_dir, f"A{args.terrain_size}x{args.terrain_size}_0x0.obj"
+usd_path = os.path.join(
+    args.output_dir, f"A{args.terrain_size}x{args.terrain_size}_0x0.usd"
 )
+prim_path = f"/World/A{args.terrain_size}x{args.terrain_size}_0x0/mesh"
 mesh_gen = TerrainMeshGenerator(
     physical_size_m=args.terrain_size,
     hill_path_npy=npy_path,
-    obj_output_path=obj_path,
+    obj_output_path=usd_path,
+    prim_path=prim_path,
     macro_z_scale=1,
     bump_path_npy=os.path.join(args.texture_dir, "displacement.jpg"),
     micro_z_scale=0.05,
     road_path=args.roadmap,
 )
-mesh_gen.process()
-
+mesh_gen.save_heightmap_usdc()
+"""
 # === STEP 5: Convert OBJ → USD ===
 usd_path = os.path.join(
     args.output_dir, f"A{args.terrain_size}x{args.terrain_size}_0x0.usd"
@@ -193,6 +205,7 @@ convert_single_file(obj_path, usd_path, load_materials=True)
 # === STEP 6: Apply UV mapping and material ===
 prim_path = f"/World/A{args.terrain_size}x{args.terrain_size}_0x0/mesh"
 assign_cube_uvs(usd_path, prim_path)
+"""
 assign_material_to_usd(usd_path, args.texture_dir, prim_path, args.terrain_size)
 
 # === STEP 7: Semantic map generation ===
@@ -277,15 +290,48 @@ vegetation_streamer = VegetationStreamer(
 stage = omni.usd.get_context().get_stage()
 world = World(stage_units_in_meters=1.0)
 world.set_simulation_dt(physics_dt=0.002, rendering_dt=0.005)
-
+Initialize = True
 # manually setting Husky's ThirdPersonCamera as active viewport
-ThirdPersonCam = "/World/Robot/Base_link/thirdperson_view"
+ThirdPersonCam = "/World/Husky/Base_link/thirdperson_view"
 if stage.GetPrimAtPath(ThirdPersonCam):
     viewport_api = vp_utils.get_active_viewport()
     viewport_api.set_active_camera(ThirdPersonCam)
 
+# post processing settings
+
+# Global Volumetric Effects (RenderSettings/Common)
+
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/raytracing/inscattering/enabled", value=True
+)
+
+# FFT Bloom settings (RenderSettings/PostProcessing)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/lensFlares/enabled", value=True
+)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/lensFlares/flareScale", value=0.3
+)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/lensFlares/physicalSettings", value=False
+)
+
+# Motion Blur (RenderSettings/PostProcessing)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/motionblur/enabled", value=True
+)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/motionblur/maxBlurDiameterFraction", value=0.02
+)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/motionblur/exposureFraction", value=1.0
+)
+omni.kit.commands.execute(
+    "ChangeSetting", path="/rtx/post/motionblur/numSamples", value=8
+)
+
 # extracting robot prim from stage
-robot_prim = stage.GetPrimAtPath("/World/Robot/Base_link")
+robot_prim = stage.GetPrimAtPath("/World/Husky/Base_link")
 xformable = UsdGeom.Xformable(robot_prim)
 
 prims_utils.create_prim(
@@ -329,8 +375,12 @@ def track_robot_position():
                 proto_path = instancer_path + f"/Proto_{i}"
                 print(proto_path)
                 prim = stage.GetPrimAtPath(f"{proto_path}/Grass_LOD")
-                variant_set = prim.GetVariantSets().GetVariantSet("LODVariant")
-                variant_set.SetVariantSelection("LOD0")
+                if prim.IsValid():
+                    variant_sets = prim.GetVariantSets()
+                    if "LODVariant" in variant_sets.GetNames():
+                        variant_sets.GetVariantSet("LODVariant").SetVariantSelection(
+                            "LOD0"
+                        )
 
             noise.generate_and_save_area(
                 x_start_m=world_x,
@@ -343,17 +393,17 @@ def track_robot_position():
             mesh_gen = TerrainMeshGenerator(
                 physical_size_m=args.tile_size,
                 hill_path_npy=npy_path,
-                obj_output_path=obj_path,
+                obj_output_path=usd_path,
+                prim_path=prim_path,
                 macro_z_scale=1,
                 bump_path_npy=os.path.join(args.texture_dir, "displacement.jpg"),
-                micro_z_scale=0.0,
+                micro_z_scale=0.05,
                 road_path=args.roadmap,
-                road_z_scale=1.0,
             )
-            mesh_gen.process()
+            mesh_gen.save_heightmap_usdc()
 
-            convert_single_file(obj_path, usd_path, load_materials=True)
-            assign_cube_uvs(usd_path, prim_path)
+            # convert_single_file(obj_path, usd_path, load_materials=True)
+            # assign_cube_uvs(usd_path, prim_path)
             assign_material_to_usd(
                 usd_path, args.texture_dir, prim_path, args.tile_size
             )
@@ -378,7 +428,7 @@ def track_robot_position():
 
 args = parser.parse_args()
 timeline = omni.timeline.get_timeline_interface()
-SIM_FPS = 60.0
+SIM_FPS = 40.0
 LIDAR_HZ = 10.0
 LIDAR_INTERVAL_STEPS = int(SIM_FPS / LIDAR_HZ)
 
@@ -414,3 +464,8 @@ else:
     while simulation_app.is_running():
         simulation_app.update()
         track_robot_position()
+        if Initialize:
+            instancer._add_lidar(Initialize=True)
+            # instancer._add_camera(Initialize=True)
+            print(f"added Lidar =====================")
+            Initialize = False
