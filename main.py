@@ -277,7 +277,7 @@ vegetation_streamer = VegetationStreamer(
 stage = omni.usd.get_context().get_stage()
 world = World(stage_units_in_meters=1.0)
 world.set_simulation_dt(physics_dt=0.002, rendering_dt=0.005)
-Initialize = True
+
 # manually setting Husky's ThirdPersonCamera as active viewport
 ThirdPersonCam = "/World/Robot/Base_link/thirdperson_view"
 if stage.GetPrimAtPath(ThirdPersonCam):
@@ -378,7 +378,7 @@ def track_robot_position():
 
 args = parser.parse_args()
 timeline = omni.timeline.get_timeline_interface()
-SIM_FPS = 40.0
+SIM_FPS = 60.0
 LIDAR_HZ = 10.0
 LIDAR_INTERVAL_STEPS = int(SIM_FPS / LIDAR_HZ)
 
@@ -414,8 +414,3 @@ else:
     while simulation_app.is_running():
         simulation_app.update()
         track_robot_position()
-        if Initialize:
-            instancer._add_lidar(Initialize=True)
-            # instancer._add_camera(Initialize=True)
-            print(f"added Lidar =====================")
-            Initialize = False
