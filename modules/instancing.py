@@ -87,6 +87,7 @@ import random
 
 # === Third-Party ===
 import numpy as np
+import hashlib
 
 # === Isaac Sim Core ===
 import omni.usd
@@ -99,7 +100,7 @@ from isaacsim.sensors.camera import Camera
 import omni.syntheticdata._syntheticdata as sd
 
 # === USD / Pixar ===
-from pxr import UsdGeom, Sdf, Gf, UsdLux
+from pxr import UsdGeom, Sdf, Gf, UsdLux, Vt
 
 
 class Instancer:
@@ -163,12 +164,13 @@ class Instancer:
         self.tree_instancer_path = self.instancer_path + "2"
 
         # === Create PointInstancers ===
-        self.instancer = self._create_instancer(
-            self.instancer_path, self.grass_models, lod="LOD1"
-        )
+        self.total_models = self.grass_models + self.tree_models
+        self.instancer = self._create_instancer(self.instancer_path, self.total_models)
+        """
         self.tree_instancer = self._create_instancer(
             self.tree_instancer_path, self.tree_models
         )
+        """
 
     # === Stage Preparation ===
     def _prepare_stage(self):
@@ -188,7 +190,7 @@ class Instancer:
             print("[✓] HDRI Dome Light set")
 
     # === Instancer Creation ===
-    def _create_instancer(self, path, model_paths, lod=None):
+    def _create_instancer(self, path, model_paths):
         """Creates a USD PointInstancer and assigns model prototypes."""
         instancer = UsdGeom.PointInstancer.Define(self.stage, Sdf.Path(path))
         proto_paths = []
@@ -197,12 +199,11 @@ class Instancer:
             proto_prim = self.stage.DefinePrim(proto_prim_path, "Xform")
             proto_prim.GetReferences().AddReference(model_path)
             proto_paths.append(proto_prim.GetPath())
-
-            # Optional LOD variant selection
-            if lod:
-                lod_prim = self.stage.GetPrimAtPath(f"{proto_prim_path}/Grass_LOD")
-                variant_set = lod_prim.GetVariantSets().GetVariantSet("LODVariant")
-                variant_set.SetVariantSelection(lod)
+            lod_prim = self.stage.GetPrimAtPath(f"{proto_prim_path}/Grass_LOD")
+            if lod_prim.IsValid():
+                variant_sets = lod_prim.GetVariantSets()
+                if "LODVariant" in variant_sets.GetNames():
+                    variant_sets.GetVariantSet("LODVariant").SetVariantSelection("LOD1")
 
         instancer.CreatePrototypesRel().SetTargets(proto_paths)
         return instancer
@@ -223,6 +224,9 @@ class Instancer:
         self.tile_y = self.world_y / self.terrain_size_m
         self._scatter_grass(self.N_grass)
         self._scatter_trees(self.Poisson)
+        cleared = self.clear_unused_prototype_payloads(self.stage, self.instancer_path)
+        if cleared:
+            print(f"[PRUNE] Cleared payloads for {cleared} unused prototype slots")
 
     def _scatter_grass(self, points):
         """Populates grass instances based on semantic map scale classes."""
@@ -251,25 +255,67 @@ class Instancer:
         self.instancer.CreateProtoIndicesAttr().Set(proto_indices)
 
     def _scatter_trees(self, points):
-        """Populates tree instances using Poisson-distributed points."""
         points = points.get((self.tile_x, self.tile_y), [])
         positions, orientations, scales, proto_indices = [], [], [], []
 
+        # CDF as you had it
+        cdf = np.cumsum(self.tree_weights, dtype=np.float64)
+        cdf /= cdf[-1]
+
+        tree_offset = len(self.grass_models)  # <-- CRITICAL
+
         for x, y in points:
             z = float(self._get_height(x, y))
-            positions.append(Gf.Vec3f(x, y, z))
+            positions.append(Gf.Vec3f(float(x), float(y), z))
+
             normal = self.get_normal(x, y)
             orientations.append(self._get_orientation(x, y, normal))
+
             s = self.rng.uniform(0.8, 1.2)
             scales.append(Gf.Vec3f(float(s), float(s), float(s)))
-            proto_indices.append(
-                np.random.choice(len(self.tree_weights), p=self.tree_weights)
-            )
 
-        self.tree_instancer.CreatePositionsAttr().Set(positions)
-        self.tree_instancer.CreateOrientationsAttr().Set(orientations)
-        self.tree_instancer.CreateScalesAttr().Set(scales)
-        self.tree_instancer.CreateProtoIndicesAttr().Set(proto_indices)
+            # deterministic pick
+            h = hashlib.blake2b(
+                f"{int(x)}|{int(y)}|{self.seed}".encode(), digest_size=8
+            ).digest()
+            u = int.from_bytes(h, "little") / 2**64
+            u = min(u, np.nextafter(1.0, 0.0))
+
+            ID = int(np.searchsorted(cdf, u, side="right"))  # 0..len(tree_models)-1
+            proto_indices.append(ID + tree_offset)  # <-- OFFSET APPLIED
+
+        # Merge with existing grass arrays (keep types consistent)
+        pi = self.instancer
+        pos = list(pi.GetPositionsAttr().Get())
+        pos.extend(positions)
+        pi.GetPositionsAttr().Set(pos)
+        ori = list(pi.GetOrientationsAttr().Get())
+        ori.extend(orientations)
+        pi.GetOrientationsAttr().Set(ori)
+        scl = list(pi.GetScalesAttr().Get())
+        scl.extend(scales)
+        pi.GetScalesAttr().Set(scl)
+        idx = list(pi.GetProtoIndicesAttr().Get())
+        idx.extend(proto_indices)
+        pi.GetProtoIndicesAttr().Set(idx)
+
+    def clear_unused_prototype_payloads(self, stage, instancer_path):
+        pi = UsdGeom.PointInstancer(stage.GetPrimAtPath(instancer_path))
+        idx = list(pi.GetProtoIndicesAttr().Get() or [])
+        protos = list(pi.GetPrototypesRel().GetTargets() or [])
+        used = sorted(set(i for i in idx if 0 <= i < len(protos)))
+        if not used:  # no valid usage → delete instancer or bail
+            return (len(protos), 0)
+
+        remap = {old: new for new, old in enumerate(used)}
+        pi.GetProtoIndicesAttr().Set(Vt.IntArray([remap[i] for i in idx]))
+        pi.GetPrototypesRel().SetTargets([protos[i] for i in used])
+
+        # now safe to delete old unused proto prims
+        for i, p in enumerate(protos):
+            if i not in used:
+                stage.RemovePrim(p)
+        return (len(protos), len(used))
 
     # === Orientation and Normals ===
     def _get_orientation(self, x, y, normal):
@@ -320,10 +366,10 @@ class Instancer:
         self._setup_lighting()
         self._add_robot()
         self._add_lidar()
-        self._add_camera()
+        # self._add_camera()
 
     def _add_robot(self):
-        prim_path = "/World/Robot"
+        prim_path = "/World/Husky"
         stage_utils.add_reference_to_stage(
             usd_path=self.Robot_path, prim_path=prim_path
         )
@@ -333,41 +379,69 @@ class Instancer:
         center = (self.global_size / 2) + 5
         center_height = self._get_height(center, center)
         xform.GetOrderedXformOps()[0].Set(Gf.Vec3f((center, center, center_height + 1)))
-        print("[✓] Robot added")
+        print("[✓] Husky added")
 
-    def _add_lidar(self):
-        """Adds RTX LiDAR and configures ROS2 publishing."""
+    def _add_lidar(self, Initialize=False):
+
+        if Initialize:
+
+            # RTX sensors are cameras and must be assigned to their own render product
+            hydra_texture = rep.create.render_product(
+                "/World/Husky/Base_link/Lidar", [1, 1], name="Isaac"
+            )
+
+            # Create Point cloud publisher pipeline in the post process graph
+            writer = rep.writers.get("RtxLidar" + "ROS2PublishPointCloud")
+            writer.initialize(topicName="point_cloud", frameId="Base_link")
+            writer.attach([hydra_texture])
+
+            # Create the debug draw pipeline in the post process graph
+            writer = rep.writers.get("RtxLidar" + "DebugDrawPointCloud")
+            writer.attach([hydra_texture])
+
+            # Create LaserScan publisher pipeline in the post process graph
+            writer = rep.writers.get("RtxLidar" + "ROS2PublishLaserScan")
+            writer.initialize(topicName="scan", frameId="Base_link")
+            writer.attach([hydra_texture])
+            print("[✓] Lidar Should be initialized ============")
+            return
+
         _, sensor = omni.kit.commands.execute(
             "IsaacSensorCreateRtxLidar",
-            path="/World/Robot/Base_link/Lidar",
+            path="/World/Husky/Base_link/Lidar",
             config="OS1_REV7_128ch10hz2048res",
             translation=(0.22125, 0, 0.30296),
-            orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
-        )
-        render_product = rep.create.render_product(
-            sensor.GetPath(), [1, 1], name="Isaac"
+            orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),  # Gf.Quatd is w,i,j,k
         )
 
-        # ROS2 Point Cloud
-        writer = rep.writers.get("RtxLidarROS2PublishPointCloud")
-        writer.initialize(topicName="point_cloud", frameId="Base_link")
-        writer.attach([render_product])
+    def _add_camera(self, Initialize=False):
+        camera_prim_path = "/World/Husky/Base_link/camera"
 
-        # ROS2 Laser Scan
-        writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
-        writer.initialize(topicName="scan", frameId="Base_link")
-        writer.attach([render_product])
+        if Initialize:
+            # Create render product from prim path
+            render_product = rep.create.render_product(camera_prim_path, [480, 320])
 
-        # Debug visualization
-        writer = rep.writers.get("RtxLidarDebugDrawPointCloud")
-        writer.attach([render_product])
-        print("[✓] Lidar sensor added")
+            # Get the renderVar string for RGB images
+            rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(
+                sd.SensorType.Rgb.name
+            )
 
-    def _add_camera(self):
-        """Adds RGB camera and configures ROS2 image publishing."""
+            # Initialize ROS2 image writer
+            writer = rep.writers.get(rv + "ROS2PublishImage")
+            writer.initialize(
+                frameId="Base_link",
+                nodeNamespace="",
+                queueSize=1,
+                topicName="/camera/image_raw",
+            )
+            writer.attach([render_product])
+            print("[✓] Camera writer initialized ============")
+            return
+
+        # Create the camera prim
         width, height = 480, 320
-        camera = Camera(
-            prim_path="/World/Robot/Base_link/camera",
+        self.camera = Camera(
+            prim_path=camera_prim_path,
             translation=(0, 0, 1),
             frequency=1,
             resolution=(width, height),
@@ -375,19 +449,5 @@ class Instancer:
                 np.array([0, 90, 0]), degrees=True
             ),
         )
-        camera.initialize()
-
-        render_product = camera.get_render_product_path()
-        rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(
-            sd.SensorType.Rgb.name
-        )
-
-        writer = rep.writers.get(rv + "ROS2PublishImage")
-        writer.initialize(
-            frameId="Base_link",
-            nodeNamespace="",
-            queueSize=1,
-            topicName="/camera/image_raw",
-        )
-        writer.attach([render_product])
+        self.camera.initialize()
         print("[✓] RGB camera added")
