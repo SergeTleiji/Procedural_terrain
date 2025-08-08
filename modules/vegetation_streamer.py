@@ -148,7 +148,6 @@ class VegetationStreamer:
         """
         instancer_path = f"/World/Instancer_Tree_{self.name_x}x{self.name_y}"
         prims_utils.delete_prim(instancer_path)
-        prims_utils.delete_prim(f"{instancer_path}2")
         # For future expansion: handle more than two instancer types.
 
     def update(self, robot_pos):
