@@ -116,8 +116,10 @@ class TerrainStreamer:
         for i, _ in enumerate(self.grass_models):
             proto_path = instancer_path + f"/Proto_{i}"
             prim = self.stage.GetPrimAtPath(f"{proto_path}/Grass_LOD")
-            variant_set = prim.GetVariantSets().GetVariantSet("LODVariant")
-            variant_set.SetVariantSelection("LOD1")
+            if prim.IsValid():
+                variant_sets = prim.GetVariantSets()
+                if "LODVariant" in variant_sets.GetNames():
+                    variant_sets.GetVariantSet("LODVariant").SetVariantSelection("LOD1")
 
         # Delete the tile prim
         prims_utils.delete_prim(tile_path)
